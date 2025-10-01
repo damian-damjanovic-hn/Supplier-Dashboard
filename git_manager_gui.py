@@ -2,6 +2,7 @@ import os
 import sys
 import shlex
 import queue
+import shutil
 import threading
 import subprocess
 import platform
@@ -44,23 +45,18 @@ def parse_status_porcelain(text):
     for line in text.splitlines():
         if not line.strip():
             continue
-        # Format: XY <path> (for renames: R? <src> -> <dst>)
-        # Example: ' M file.txt' or 'A  file2.py' or '?? newfile'
         x = line[:2]
         rest = line[3:]
         index_flag = x[0]
         wt_flag = x[1]
-        status = None
         if line.startswith("??"):
-            status = "Untracked"
-            path = line[3:]
-            items.append({"path": path.strip(), "status": status, "index": "?", "worktree": "?"})
+            items.append({"path": line[3:].strip(), "status": "Untracked", "index": "?", "worktree": "?"})
             continue
 
         # Handle rename format: 'R  src -> dst'
         if "->" in rest:
             try:
-                src, dst = rest.split("->", 1)
+                _, dst = rest.split("->", 1)
                 path = dst.strip()
                 status = "Renamed"
             except Exception:
@@ -68,7 +64,6 @@ def parse_status_porcelain(text):
                 status = "Renamed"
         else:
             path = rest.strip()
-            # Map flags to friendly status
             mapping = {
                 "M": "Modified",
                 "A": "Added",
@@ -78,12 +73,11 @@ def parse_status_porcelain(text):
                 "U": "Unmerged",
                 " ": " "
             }
+            status = "Changed"
             if index_flag != " ":
                 status = mapping.get(index_flag, index_flag)
             elif wt_flag != " ":
                 status = mapping.get(wt_flag, wt_flag)
-            else:
-                status = "Changed"
 
         items.append({"path": path, "status": status, "index": index_flag, "worktree": wt_flag})
     return items
@@ -118,8 +112,8 @@ class GitManagerApp(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
         self.master.title("Git Manager Pro")
-        self.master.geometry("1100x700")
-        self.master.minsize(980, 620)
+        self.master.geometry("1120x720")
+        self.master.minsize(980, 640)
 
         # State
         self.repo_path = tk.StringVar(value="")
@@ -128,12 +122,13 @@ class GitManagerApp(ttk.Frame):
         self.commit_msg = tk.StringVar(value="")
         self.reset_depth = tk.IntVar(value=1)
         self.stage_all = tk.BooleanVar(value=True)
-        self.remote_branch = tk.StringVar(value="")
         self.current_branch = tk.StringVar(value="")
         self.selected_branch = tk.StringVar(value="")
         self.new_branch_name = tk.StringVar(value="")
         self.rename_branch_to = tk.StringVar(value="")
         self.commits_to_show = tk.IntVar(value=50)
+        self.stash_message = tk.StringVar(value="")
+        self.stash_include_untracked = tk.BooleanVar(value=True)
 
         # Async queue
         self.result_queue = queue.Queue()
@@ -145,8 +140,6 @@ class GitManagerApp(ttk.Frame):
         self._build_statusbar()
 
         self._bind_shortcuts()
-
-        # Try preloading global git config
         self._load_global_config()
 
     # ---------------------------
@@ -157,98 +150,64 @@ class GitManagerApp(ttk.Frame):
         top = ttk.Frame(self.master)
         top.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(8, 4))
 
-        # Repo selector
         ttk.Label(top, text="Repository:", bootstyle="info").grid(row=0, column=0, sticky="w")
-        self.repo_entry = ttk.Entry(top, textvariable=self.repo_path, width=70)
-        self.repo_entry.grid(row=0, column=1, padx=6, sticky="we", columnspan=2)
-        ttk.Button(top, text="Browse…", command=self.choose_repo, bootstyle="secondary-outline").grid(row=0, column=3, padx=4)
-        ttk.Button(top, text="Open Folder", command=self.open_folder, bootstyle="secondary").grid(row=0, column=4, padx=4)
-        ttk.Button(top, text="Open Terminal", command=self.open_terminal, bootstyle="secondary").grid(row=0, column=5, padx=4)
+        self.repo_entry = ttk.Entry(top, textvariable=self.repo_path, width=80)
+        self.repo_entry.grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Button(top, text="Browse…", command=self.choose_repo, bootstyle="secondary-outline").grid(row=0, column=2, padx=4)
 
-        # Branch actions
-        ttk.Label(top, text="Branch:", bootstyle="info").grid(row=1, column=0, sticky="w", pady=(6,0))
-        self.branch_combo = ttk.Combobox(top, textvariable=self.selected_branch, width=30, state="readonly")
-        self.branch_combo.grid(row=1, column=1, sticky="w", pady=(6,0))
-        ttk.Button(top, text="Refresh", command=self.refresh_all, bootstyle="secondary-outline").grid(row=1, column=2, padx=6, pady=(6,0))
-        ttk.Button(top, text="Checkout", command=self.checkout_selected, bootstyle="primary").grid(row=1, column=3, padx=4, pady=(6,0))
-        ttk.Button(top, text="Pull", command=self.pull, bootstyle="success").grid(row=1, column=4, padx=4, pady=(6,0))
-        ttk.Button(top, text="Fetch", command=self.fetch, bootstyle="warning").grid(row=1, column=5, padx=4, pady=(6,0))
-        ttk.Button(top, text="Push", command=self.push, bootstyle="danger").grid(row=1, column=6, padx=4, pady=(6,0))
-
-        # Progress bar
+        # Progress bar (thin)
         self.progress = ttk.Progressbar(top, mode="indeterminate", bootstyle="striped")
-        self.progress.grid(row=2, column=0, columnspan=7, sticky="we", pady=(8,0))
+        self.progress.grid(row=1, column=0, columnspan=3, sticky="we", pady=(8,0))
 
-        # Grid weights
         top.grid_columnconfigure(1, weight=1)
 
     def _build_body(self):
         paned = ttk.Panedwindow(self.master, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        # Left sidebar (controls)
-        left = ttk.Frame(paned, padding=(8,8))
+        # Left: tabbed controls
+        left = ttk.Frame(paned, padding=(6,6))
         paned.add(left, weight=1)
 
-        # Right content (tabs)
+        # Right: content tabs
         right = ttk.Frame(paned)
         paned.add(right, weight=3)
 
-        # ----- Left: Controls -----
-        # Config
-        cfg = self._card(left, "Git Config")
-        ttk.Label(cfg, text="User Name").grid(row=0, column=0, sticky="w")
-        ttk.Entry(cfg, textvariable=self.user_name, width=28).grid(row=0, column=1, sticky="we", padx=6)
-        ttk.Label(cfg, text="User Email").grid(row=1, column=0, sticky="w", pady=(6,0))
-        ttk.Entry(cfg, textvariable=self.user_email, width=28).grid(row=1, column=1, sticky="we", padx=6, pady=(6,0))
-        ttk.Button(cfg, text="Set Global Config", command=self.set_config, bootstyle="secondary").grid(row=2, column=0, columnspan=2, pady=(10,0), sticky="we")
+        # ----- Left Tabs -----
+        self.left_tabs = ttk.Notebook(left, bootstyle="secondary")
+        self.left_tabs.pack(fill=tk.BOTH, expand=True)
 
-        # Init / Clone
-        repoops = self._card(left, "Repository")
-        ttk.Button(repoops, text="Init Repo in Folder…", command=self.init_repo, bootstyle="secondary-outline").grid(row=0, column=0, columnspan=2, sticky="we")
-        ttk.Label(repoops, text="Clone URL").grid(row=1, column=0, sticky="w", pady=(8,0))
-        self.clone_url = tk.StringVar()
-        ttk.Entry(repoops, textvariable=self.clone_url, width=28).grid(row=1, column=1, sticky="we", padx=6, pady=(8,0))
-        ttk.Button(repoops, text="Clone to Folder…", command=self.clone_repo, bootstyle="secondary-outline").grid(row=2, column=0, columnspan=2, sticky="we", pady=(6,0))
+        # Repo tab
+        self.tab_repo = ttk.Frame(self.left_tabs, padding=8)
+        self.left_tabs.add(self.tab_repo, text="Repository")
+        self._build_tab_repository(self.tab_repo)
 
-        # Commit
-        commit = self._card(left, "Commit")
-        ttk.Label(commit, text="Message").grid(row=0, column=0, sticky="w")
-        ttk.Entry(commit, textvariable=self.commit_msg, width=28).grid(row=0, column=1, sticky="we", padx=6)
-        ttk.Checkbutton(commit, text="Stage all (incl. untracked)", variable=self.stage_all).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6,0))
-        ttk.Button(commit, text="Commit  (Ctrl+Enter)", command=self.commit_changes, bootstyle="success").grid(row=2, column=0, columnspan=2, sticky="we", pady=(8,0))
-        ttk.Button(commit, text="Amend (no edit)", command=self.amend_commit, bootstyle="warning-outline").grid(row=3, column=0, sticky="we", pady=(6,0))
-        ttk.Button(commit, text="Amend (edit message)", command=self.change_commit_msg, bootstyle="warning-outline").grid(row=3, column=1, sticky="we", pady=(6,0))
+        # Branches tab
+        self.tab_branch = ttk.Frame(self.left_tabs, padding=8)
+        self.left_tabs.add(self.tab_branch, text="Branches")
+        self._build_tab_branches(self.tab_branch)
 
-        # Undo / Reset
-        undo = self._card(left, "Undo / Reset")
-        ttk.Label(undo, text="Depth (N)").grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(undo, from_=1, to=50, textvariable=self.reset_depth, width=6).grid(row=0, column=1, sticky="w", padx=6)
-        ttk.Button(undo, text="Soft Reset HEAD~N", command=self.soft_reset, bootstyle="secondary-outline").grid(row=1, column=0, columnspan=2, sticky="we", pady=(6,0))
-        ttk.Button(undo, text="Hard Reset HEAD~N", command=self.hard_reset, bootstyle="danger-outline").grid(row=2, column=0, columnspan=2, sticky="we", pady=(6,0))
-        ttk.Button(undo, text="Reset to origin/<branch>", command=self.reset_to_remote, bootstyle="danger").grid(row=3, column=0, columnspan=2, sticky="we", pady=(6,0))
+        # Commit tab
+        self.tab_commit = ttk.Frame(self.left_tabs, padding=8)
+        self.left_tabs.add(self.tab_commit, text="Commit")
+        self._build_tab_commit(self.tab_commit)
 
-        # Branch Ops
-        br = self._card(left, "Branch Ops")
-        ttk.Label(br, text="New branch").grid(row=0, column=0, sticky="w")
-        ttk.Entry(br, textvariable=self.new_branch_name, width=18).grid(row=0, column=1, sticky="we", padx=6)
-        ttk.Button(br, text="Create & Checkout", command=self.create_branch, bootstyle="primary").grid(row=1, column=0, columnspan=2, sticky="we", pady=(6,0))
-        ttk.Label(br, text="Rename current to").grid(row=2, column=0, sticky="w", pady=(8,0))
-        ttk.Entry(br, textvariable=self.rename_branch_to, width=18).grid(row=2, column=1, sticky="we", padx=6, pady=(8,0))
-        ttk.Button(br, text="Rename", command=self.rename_branch, bootstyle="warning").grid(row=3, column=0, columnspan=2, sticky="we", pady=(6,0))
-        ttk.Button(br, text="Delete selected", command=self.delete_selected_branch, bootstyle="danger-outline").grid(row=4, column=0, columnspan=2, sticky="we", pady=(6,0))
+        # Reset tab
+        self.tab_reset = ttk.Frame(self.left_tabs, padding=8)
+        self.left_tabs.add(self.tab_reset, text="Reset")
+        self._build_tab_reset(self.tab_reset)
 
-        # Stash
-        stash = self._card(left, "Stash")
-        ttk.Button(stash, text="Stash Save", command=self.stash_save, bootstyle="secondary-outline").grid(row=0, column=0, sticky="we")
-        ttk.Button(stash, text="Stash Pop", command=self.stash_pop, bootstyle="secondary-outline").grid(row=0, column=1, sticky="we", padx=6)
-        ttk.Button(stash, text="List in Console", command=self.stash_list, bootstyle="secondary-outline").grid(row=1, column=0, columnspan=2, sticky="we", pady=(6,0))
+        # Stash tab
+        self.tab_stash = ttk.Frame(self.left_tabs, padding=8)
+        self.left_tabs.add(self.tab_stash, text="Stash")
+        self._build_tab_stash(self.tab_stash)
 
-        # Make cards stretch
-        for f in (cfg, repoops, commit, undo, br, stash):
-            f.grid_columnconfigure(1, weight=1)
+        # Settings tab
+        self.tab_settings = ttk.Frame(self.left_tabs, padding=8)
+        self.left_tabs.add(self.tab_settings, text="Settings")
+        self._build_tab_settings(self.tab_settings)
 
-        # ----- Right: Tabs -----
+        # ----- Right: Content Tabs -----
         self.tabs = ttk.Notebook(right, bootstyle="dark")
         self.tabs.pack(fill=tk.BOTH, expand=True)
 
@@ -261,19 +220,24 @@ class GitManagerApp(ttk.Frame):
         self.tree.heading("status", text="Status")
         self.tree.heading("path", text="Path")
         self.tree.column("status", width=110, anchor="w")
-        self.tree.column("path", width=700, anchor="w")
-        self.tree.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
+        self.tree.column("path", width=720, anchor="w")
+        self.tree.grid(row=0, column=0, columnspan=4, sticky="nsew")
 
-        btns = ttk.Frame(self.changes_tab)
-        btns.pack(fill=tk.X, pady=(8,0))
-        ttk.Button(btns, text="Stage Selected", command=self.stage_selected, bootstyle="primary").pack(side=tk.LEFT, padx=(0,6))
-        ttk.Button(btns, text="Unstage Selected", command=self.unstage_selected, bootstyle="warning").pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Discard Changes (Selected)", command=self.discard_selected, bootstyle="danger-outline").pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Refresh", command=self.refresh_all, bootstyle="secondary-outline").pack(side=tk.RIGHT)
+        ttk.Button(self.changes_tab, text="Stage Selected", command=self.stage_selected, bootstyle="primary").grid(row=1, column=0, sticky="w", pady=(8,0))
+        ttk.Button(self.changes_tab, text="Unstage Selected", command=self.unstage_selected, bootstyle="warning").grid(row=1, column=1, sticky="w", padx=6, pady=(8,0))
+        ttk.Button(self.changes_tab, text="Discard Selected", command=self.discard_selected, bootstyle="danger-outline").grid(row=1, column=2, sticky="w", padx=6, pady=(8,0))
+        ttk.Button(self.changes_tab, text="Refresh", command=self.refresh_all, bootstyle="secondary-outline").grid(row=1, column=3, sticky="e", pady=(8,0))
+
+        self.changes_tab.grid_rowconfigure(0, weight=1)
+        self.changes_tab.grid_columnconfigure(0, weight=1)
+        self.changes_tab.grid_columnconfigure(1, weight=0)
+        self.changes_tab.grid_columnconfigure(2, weight=0)
+        self.changes_tab.grid_columnconfigure(3, weight=0)
 
         # Commits tab
         self.log_tab = ttk.Frame(self.tabs, padding=8)
         self.tabs.add(self.log_tab, text="Commits")
+
         topbar = ttk.Frame(self.log_tab)
         topbar.pack(fill=tk.X)
         ttk.Label(topbar, text="Show last").pack(side=tk.LEFT)
@@ -284,8 +248,8 @@ class GitManagerApp(ttk.Frame):
         self.log_list = ttk.Treeview(self.log_tab, columns=("sha", "msg"), show="headings", height=16, bootstyle="dark")
         self.log_list.heading("sha", text="SHA")
         self.log_list.heading("msg", text="Message")
-        self.log_list.column("sha", width=90, anchor="w")
-        self.log_list.column("msg", width=700, anchor="w")
+        self.log_list.column("sha", width=100, anchor="w")
+        self.log_list.column("msg", width=760, anchor="w")
         self.log_list.pack(fill=tk.BOTH, expand=True, pady=(8,0))
         ttk.Button(self.log_tab, text="Copy Selected SHA", command=self.copy_selected_sha, bootstyle="secondary").pack(side=tk.RIGHT, pady=6)
 
@@ -310,10 +274,103 @@ class GitManagerApp(ttk.Frame):
         self.status_right = ttk.Label(status, text="", anchor="e")
         self.status_right.pack(side=tk.RIGHT)
 
-    def _card(self, parent, title):
-        frm = ttk.Labelframe(parent, text=title, bootstyle="secondary", padding=(8,8))
-        frm.pack(fill=tk.X, pady=(6,0))
-        return frm
+    # ----- Left tab builders -----
+
+    def _build_tab_repository(self, parent):
+        r = parent
+        row = 0
+        ttk.Button(r, text="Open Folder", command=self.open_folder, bootstyle="secondary").grid(row=row, column=0, columnspan=2, sticky="we"); row += 1
+        ttk.Button(r, text="Open Terminal", command=self.open_terminal, bootstyle="secondary").grid(row=row, column=0, columnspan=2, sticky="we", pady=(6,0)); row += 1
+
+        ttk.Separator(r).grid(row=row, column=0, columnspan=2, sticky="we", pady=8); row += 1
+
+        ttk.Button(r, text="Init Repo in Folder…", command=self.init_repo, bootstyle="secondary-outline").grid(row=row, column=0, columnspan=2, sticky="we"); row += 1
+
+        ttk.Label(r, text="Clone URL").grid(row=row, column=0, sticky="w", pady=(8,0))
+        self.clone_url = tk.StringVar()
+        ttk.Entry(r, textvariable=self.clone_url, width=28).grid(row=row, column=1, sticky="we", padx=6, pady=(8,0)); row += 1
+        ttk.Button(r, text="Clone to Folder…", command=self.clone_repo, bootstyle="secondary-outline").grid(row=row, column=0, columnspan=2, sticky="we", pady=(6,0)); row += 1
+
+        r.grid_columnconfigure(1, weight=1)
+
+    def _build_tab_branches(self, parent):
+        b = parent
+        row = 0
+        ttk.Label(b, text="Current/Select Branch").grid(row=row, column=0, sticky="w"); row += 1
+        self.branch_combo = ttk.Combobox(b, textvariable=self.selected_branch, width=28, state="readonly")
+        self.branch_combo.grid(row=row, column=0, columnspan=2, sticky="we"); row += 1
+
+        btns = ttk.Frame(b)
+        btns.grid(row=row, column=0, columnspan=2, sticky="we", pady=(6,0)); row += 1
+        ttk.Button(btns, text="Checkout", command=self.checkout_selected, bootstyle="primary").pack(side=tk.LEFT)
+        ttk.Button(btns, text="Fetch", command=self.fetch, bootstyle="warning").pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Pull", command=self.pull, bootstyle="success").pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Push", command=self.push, bootstyle="danger").pack(side=tk.LEFT, padx=6)
+
+        ttk.Separator(b).grid(row=row, column=0, columnspan=2, sticky="we", pady=8); row += 1
+
+        ttk.Label(b, text="New branch").grid(row=row, column=0, sticky="w")
+        ttk.Entry(b, textvariable=self.new_branch_name, width=18).grid(row=row, column=1, sticky="we", padx=6); row += 1
+        ttk.Button(b, text="Create & Checkout", command=self.create_branch, bootstyle="primary").grid(row=row, column=0, columnspan=2, sticky="we", pady=(6,0)); row += 1
+
+        ttk.Label(b, text="Rename current to").grid(row=row, column=0, sticky="w", pady=(8,0))
+        ttk.Entry(b, textvariable=self.rename_branch_to, width=18).grid(row=row, column=1, sticky="we", padx=6, pady=(8,0)); row += 1
+        ttk.Button(b, text="Rename", command=self.rename_branch, bootstyle="warning").grid(row=row, column=0, columnspan=2, sticky="we"); row += 1
+
+        ttk.Button(b, text="Delete selected", command=self.delete_selected_branch, bootstyle="danger-outline").grid(row=row, column=0, columnspan=2, sticky="we", pady=(6,0)); row += 1
+
+        b.grid_columnconfigure(1, weight=1)
+
+    def _build_tab_commit(self, parent):
+        c = parent
+        row = 0
+        ttk.Label(c, text="Message").grid(row=row, column=0, sticky="w")
+        ttk.Entry(c, textvariable=self.commit_msg, width=28).grid(row=row, column=1, sticky="we", padx=6); row += 1
+
+        ttk.Checkbutton(c, text="Stage all (incl. untracked)", variable=self.stage_all).grid(row=row, column=0, columnspan=2, sticky="w", pady=(6,0)); row += 1
+
+        ttk.Button(c, text="Commit  (Ctrl+Enter)", command=self.commit_changes, bootstyle="success").grid(row=row, column=0, columnspan=2, sticky="we", pady=(8,0)); row += 1
+        ttk.Button(c, text="Amend (no edit)", command=self.amend_commit, bootstyle="warning-outline").grid(row=row, column=0, sticky="we", pady=(6,0))
+        ttk.Button(c, text="Amend (edit message)", command=self.change_commit_msg, bootstyle="warning-outline").grid(row=row, column=1, sticky="we", pady=(6,0))
+
+        c.grid_columnconfigure(1, weight=1)
+
+    def _build_tab_reset(self, parent):
+        r = parent
+        row = 0
+        ttk.Label(r, text="Depth (N)").grid(row=row, column=0, sticky="w")
+        ttk.Spinbox(r, from_=1, to=50, textvariable=self.reset_depth, width=6).grid(row=row, column=1, sticky="w", padx=6); row += 1
+
+        ttk.Button(r, text="Soft Reset HEAD~N", command=self.soft_reset, bootstyle="secondary-outline").grid(row=row, column=0, columnspan=2, sticky="we", pady=(6,0)); row += 1
+        ttk.Button(r, text="Hard Reset HEAD~N", command=self.hard_reset, bootstyle="danger-outline").grid(row=row, column=0, columnspan=2, sticky="we", pady=(6,0)); row += 1
+        ttk.Button(r, text="Reset to origin/<branch>", command=self.reset_to_remote, bootstyle="danger").grid(row=row, column=0, columnspan=2, sticky="we", pady=(6,0)); row += 1
+
+        r.grid_columnconfigure(1, weight=1)
+
+    def _build_tab_stash(self, parent):
+        s = parent
+        row = 0
+        ttk.Label(s, text="Message (optional)").grid(row=row, column=0, sticky="w")
+        ttk.Entry(s, textvariable=self.stash_message, width=28).grid(row=row, column=1, sticky="we", padx=6); row += 1
+
+        ttk.Checkbutton(s, text="Include untracked (-u)", variable=self.stash_include_untracked).grid(row=row, column=0, columnspan=2, sticky="w", pady=(6,0)); row += 1
+
+        ttk.Button(s, text="Stash Save", command=self.stash_save, bootstyle="secondary-outline").grid(row=row, column=0, sticky="we"); 
+        ttk.Button(s, text="Stash Pop", command=self.stash_pop, bootstyle="secondary-outline").grid(row=row, column=1, sticky="we", padx=6); row += 1
+        ttk.Button(s, text="List in Console", command=self.stash_list, bootstyle="secondary-outline").grid(row=row, column=0, columnspan=2, sticky="we", pady=(6,0)); row += 1
+
+        s.grid_columnconfigure(1, weight=1)
+
+    def _build_tab_settings(self, parent):
+        g = parent
+        row = 0
+        ttk.Label(g, text="User Name").grid(row=row, column=0, sticky="w")
+        ttk.Entry(g, textvariable=self.user_name, width=28).grid(row=row, column=1, sticky="we", padx=6); row += 1
+        ttk.Label(g, text="User Email").grid(row=row, column=0, sticky="w", pady=(6,0))
+        ttk.Entry(g, textvariable=self.user_email, width=28).grid(row=row, column=1, sticky="we", padx=6, pady=(6,0)); row += 1
+        ttk.Button(g, text="Set Global Config", command=self.set_config, bootstyle="secondary").grid(row=row, column=0, columnspan=2, pady=(10,0), sticky="we")
+
+        g.grid_columnconfigure(1, weight=1)
 
     def _bind_shortcuts(self):
         self.master.bind("<Control-Return>", lambda e: self.commit_changes())
@@ -347,15 +404,12 @@ class GitManagerApp(ttk.Frame):
             return
         try:
             if is_windows():
-                # Opens Windows Terminal if available; otherwise fallback to cmd
                 cmd = ["wt.exe", "-d", path] if shutil.which("wt.exe") else ["cmd.exe", "/K", f"cd /d {path}"]
                 subprocess.Popen(cmd)
             elif sys.platform == "darwin":
-                # Open new Terminal window at path
                 script = f'tell application "Terminal" to do script "cd {shlex.quote(path)}"'
                 subprocess.Popen(["osascript", "-e", script])
             else:
-                # Best-effort on Linux
                 term = shutil.which("gnome-terminal") or shutil.which("konsole") or shutil.which("xterm")
                 if term and "gnome-terminal" in term:
                     subprocess.Popen([term, "--", "bash", "-lc", f"cd {shlex.quote(path)}; exec bash"])
@@ -370,16 +424,23 @@ class GitManagerApp(ttk.Frame):
             messagebox.showerror("Open Terminal", str(e))
 
     # ---------------------------
-    # Async Command Runner
+    # Async Command Runners
     # ---------------------------
 
     def run_git_async(self, args, cwd=None, label=None, refresh=False):
+        """Run a single git command asynchronously."""
+        self.run_git_chain([args], cwd=cwd, label=label, refresh=refresh)
+
+    def run_git_chain(self, commands, cwd=None, label=None, refresh=False):
+        """
+        Run a sequence of git commands asynchronously as one task.
+        `commands` is a list of arg lists: [["git","add","-A"], ["git","commit","-m","msg"]]
+        """
         if not cwd:
             cwd = self.repo_path.get().strip() or None
         if cwd and not os.path.isdir(cwd):
-            self._log(f"[{timestamp()}] ERROR: Invalid repository path: {cwd}\n")
+            self._log(f"[{timestamp()}] ERROR: Invalid repository path: {cwd}\n", is_err=True)
             return
-
         if self.running_task:
             self._log("Another operation is still running. Please wait…\n")
             return
@@ -390,23 +451,30 @@ class GitManagerApp(ttk.Frame):
             self._set_status(label)
 
         def worker():
-            out, err, rc = safe_run(args, cwd=cwd)
-            self.result_queue.put((args, out, err, rc, refresh))
+            full_log = ""
+            final_rc = 0
+            for args in commands:
+                out, err, rc = safe_run(args, cwd=cwd)
+                cmd_str = " ".join(shlex.quote(a) for a in args)
+                full_log += f"\n$ {cmd_str}\n"
+                if out:
+                    full_log += out
+                if err:
+                    full_log += err
+                final_rc = rc
+                if rc != 0:
+                    break
+            self.result_queue.put((full_log, final_rc, refresh))
 
         threading.Thread(target=worker, daemon=True).start()
         self.master.after(60, self._poll_results)
 
     def _poll_results(self):
         try:
-            args, out, err, rc, refresh = self.result_queue.get_nowait()
+            full_log, rc, refresh = self.result_queue.get_nowait()
             self.progress.stop()
             self.running_task = False
-            cmd_str = " ".join(shlex.quote(a) for a in args)
-            self._log(f"\n$ {cmd_str}\n")
-            if out:
-                self._log(out)
-            if err:
-                self._log(err, is_err=True)
+            self._log(full_log, is_err=(rc != 0))
             self._set_status(f"Done ({'OK' if rc == 0 else 'Error'})")
             if refresh:
                 self.refresh_all()
@@ -416,9 +484,6 @@ class GitManagerApp(ttk.Frame):
     def _log(self, text, is_err=False):
         self.console.insert(tk.END, text)
         self.console.see(tk.END)
-        if is_err:
-            # Simple visual flag — you can add tags for coloring if desired
-            pass
 
     def _set_status(self, text):
         self.status_left.configure(text=text)
@@ -441,8 +506,13 @@ class GitManagerApp(ttk.Frame):
         if not name or not email:
             messagebox.showwarning("Config", "User name and email are required.")
             return
-        self.run_git_async(["git", "config", "--global", "user.name", name], label="Setting user.name")
-        self.run_git_async(["git", "config", "--global", "user.email", email], label="Setting user.email")
+        self.run_git_chain(
+            [
+                ["git", "config", "--global", "user.name", name],
+                ["git", "config", "--global", "user.email", email],
+            ],
+            label="Setting global user config"
+        )
 
     def init_repo(self):
         path = filedialog.askdirectory(title="Select folder to initialize as Git repo")
@@ -468,12 +538,11 @@ class GitManagerApp(ttk.Frame):
         if not msg:
             messagebox.showwarning("Commit", "Please enter a commit message.")
             return
+        chain = []
         if self.stage_all.get():
-            # Stage all including untracked
-            self.run_git_async(["git", "add", "-A"], label="Staging all", refresh=False)
-            self.run_git_async(["git", "commit", "-m", msg], label="Committing", refresh=True)
-        else:
-            self.run_git_async(["git", "commit", "-m", msg], label="Committing", refresh=True)
+            chain.append(["git", "add", "-A"])
+        chain.append(["git", "commit", "-m", msg])
+        self.run_git_chain(chain, label="Committing changes", refresh=True)
 
     def amend_commit(self):
         if not self._repo_selected():
@@ -483,7 +552,6 @@ class GitManagerApp(ttk.Frame):
     def change_commit_msg(self):
         if not self._repo_selected():
             return
-        # This opens editor if configured
         self.run_git_async(["git", "commit", "--amend"], label="Amending (edit message)", refresh=True)
 
     def soft_reset(self):
@@ -512,9 +580,14 @@ class GitManagerApp(ttk.Frame):
             return
         if not messagebox.askyesno("Reset to Remote", f"This will set your working tree to origin/{br}.\nAll local changes will be lost. Continue?"):
             return
-        # fetch then reset
-        self.run_git_async(["git", "fetch", "origin"], label="Fetching origin", refresh=False)
-        self.run_git_async(["git", "reset", "--hard", f"origin/{br}"], label=f"Reset to origin/{br}", refresh=True)
+        self.run_git_chain(
+            [
+                ["git", "fetch", "origin"],
+                ["git", "reset", "--hard", f"origin/{br}"],
+            ],
+            label=f"Reset to origin/{br}",
+            refresh=True
+        )
 
     def pull(self):
         if not self._repo_selected():
@@ -575,7 +648,13 @@ class GitManagerApp(ttk.Frame):
     def stash_save(self):
         if not self._repo_selected():
             return
-        self.run_git_async(["git", "stash", "save", "WIP via GUI"], label="Stash save", refresh=True)
+        msg = self.stash_message.get().strip()
+        cmd = ["git", "stash", "push"]
+        if msg:
+            cmd += ["-m", msg]
+        if self.stash_include_untracked.get():
+            cmd += ["-u"]
+        self.run_git_async(cmd, label="Stash save", refresh=True)
 
     def stash_pop(self):
         if not self._repo_selected():
@@ -617,7 +696,8 @@ class GitManagerApp(ttk.Frame):
         paths = [self.tree.set(i, "path") for i in items]
         if not messagebox.askyesno("Discard Changes", f"This will discard local changes in {len(paths)} file(s).\nThis cannot be undone. Continue?"):
             return
-        self.run_git_async(["git", "checkout", "--"] + paths, label=f"Discarding {len(paths)} file(s)", refresh=True)
+        # Use modern restore to reset working tree files
+        self.run_git_async(["git", "restore", "--worktree", "--source=HEAD", "--"] + paths, label=f"Discarding {len(paths)} file(s)", refresh=True)
 
     def load_log(self):
         if not self._repo_selected():
@@ -627,13 +707,13 @@ class GitManagerApp(ttk.Frame):
         # Update treeview
         for i in self.log_list.get_children():
             self.log_list.delete(i)
-        if rc == 0:
+        if rc == 0 and out:
             for line in out.splitlines():
                 if "|" in line:
                     sha, msg = line.split("|", 1)
                     self.log_list.insert("", tk.END, values=(sha.strip(), msg.strip()))
-        else:
-            self._log(err or "Failed to load log.\n", is_err=True)
+        elif err:
+            self._log(err + "\n", is_err=True)
 
     def copy_selected_sha(self):
         sel = self.log_list.selection()
@@ -686,6 +766,7 @@ class GitManagerApp(ttk.Frame):
         path = self.repo_path.get().strip()
         if not path or not os.path.isdir(path):
             return
+
         # Current branch & ahead/behind
         out, err, rc = safe_run(["git", "status", "-sb"], cwd=path)
         if rc == 0 and out:
@@ -700,14 +781,19 @@ class GitManagerApp(ttk.Frame):
         # Branch list
         out, _, rc = safe_run(["git", "branch", "--list"], cwd=path)
         branches = []
-        if rc == 0:
+        if rc == 0 and out:
             for line in out.splitlines():
                 name = line.replace("*", "").strip()
                 if name:
                     branches.append(name)
         self.branch_combo["values"] = branches
+        # Keep selection coherent
         if self.current_branch.get() and self.current_branch.get() in branches:
             self.branch_combo.set(self.current_branch.get())
+            self.selected_branch.set(self.current_branch.get())
+        elif branches:
+            self.branch_combo.set(branches[0])
+            self.selected_branch.set(branches[0])
 
         # Changes list
         out, _, rc = safe_run(["git", "status", "--porcelain"], cwd=path)
@@ -745,6 +831,4 @@ def main():
     style.master.mainloop()
 
 if __name__ == "__main__":
-    # Some helpers (used in open_terminal)
-    import shutil  # local import to avoid top-level dependency if not used
     main()
